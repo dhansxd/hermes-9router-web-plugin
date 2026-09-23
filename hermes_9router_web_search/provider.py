@@ -222,4 +222,4 @@ class NineRouterWebSearchProvider(WebSearchProvider):
                 "metadata": data.get("metadata", {}),
             })
 
-        return {"success": True, "data": results}
+        return results
