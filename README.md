@@ -1,4 +1,4 @@
-# hermes-9router-web-search-plugin
+# hermes-9router-web-plugin
 
 9Router Web Search & Web Fetch provider plugin for [Hermes Agent](https://hermes-agent.nousresearch.com/).
 
@@ -17,13 +17,13 @@ Symlink or copy the plugin to your Hermes plugins directory:
 
 ```bash
 mkdir -p ~/.hermes/plugins/web/
-git clone https://github.com/dhansxd/hermes-9router-web-search-plugin.git ~/.hermes/plugins/web/9router-web-search
+git clone https://github.com/dhansxd/hermes-9router-web-plugin.git ~/.hermes/plugins/web/9router-web
 ```
 
 Enable the plugin:
 
 ```bash
-hermes plugins enable 9router-web-search
+hermes plugins enable 9router-web
 ```
 
 ## Configuration
