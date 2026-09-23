@@ -1,225 +1,224 @@
-"""9Router Web Search & Extract provider for Hermes.
-
-Proxies web_search and web_extract calls to a local 9Router instance
-via /v1/search (search-combo) and /v1/web/fetch (fetch-combo).
-
-Config in ~/.hermes/config.yaml:
-
-    web:
-      search_backend: 9router
-      extract_backend: 9router
-      9router:
-        base_url: http://127.0.0.1:20128   # default
-        api_key: sk-...                      # optional; reads from 9Router DB if blank
-        search_model: search-combo           # default
-        fetch_model: fetch-combo             # default
-"""
-
+"""Profile-scoped 9Router search/fetch adapter. No independent credential cache."""
 from __future__ import annotations
 
-import json
-import logging
-import os
-import sqlite3
+import asyncio
+from contextlib import closing
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import sqlite3
+from urllib.parse import urlsplit
 
+import httpx
 from agent.web_search_provider import WebSearchProvider
 
-logger = logging.getLogger(__name__)
-
-_CONFIG_CACHE: Optional[Dict[str, Any]] = None
-_CONFIG_MTIME: float = 0.0
+LOCAL_URL = "http://127.0.0.1:20128"
 
 
-def _load_config() -> Dict[str, Any]:
-    """Read 9router section from Hermes config.yaml (cached by mtime)."""
-    global _CONFIG_CACHE, _CONFIG_MTIME
-    config_path = Path.home() / ".hermes" / "config.yaml"
+def _load_config() -> dict:
+    from hermes_cli.config_effective import load_user_config_effective
     try:
-        mtime = config_path.stat().st_mtime
-    except OSError:
-        return {}
-    if _CONFIG_CACHE is not None and mtime == _CONFIG_MTIME:
-        return _CONFIG_CACHE
-    try:
-        import yaml
-        with open(config_path) as f:
-            raw = yaml.safe_load(f) or {}
-        _CONFIG_CACHE = raw.get("web", {}).get("9router", {}) or {}
-        _CONFIG_MTIME = mtime
+        raw = load_user_config_effective(fail_closed=True)
     except Exception:
-        _CONFIG_CACHE = {}
-    return _CONFIG_CACHE
+        raise ValueError("Cannot read active profile configuration") from None
+    web = raw.get("web", {})
+    if not isinstance(web, dict) or not isinstance(web.get("9router", {}), dict):
+        raise ValueError("web.9router must be a mapping")
+    return web.get("9router", {})
+
+
+def _env(name: str) -> str:
+    from agent.secret_scope import (get_secret, current_secret_scope,
+                                    serves_routed_profile, UnscopedSecretError)
+    if serves_routed_profile():
+        scope = current_secret_scope()
+        if scope is None:
+            raise UnscopedSecretError(name)
+        return scope.get(name, "") or ""
+    return get_secret(name, "") or ""
+
+
+def _string(cfg: dict, key: str, default: str = "") -> str:
+    value = cfg.get(key, default)
+    if not isinstance(value, str):
+        raise ValueError(f"web.9router.{key} must be a string")
+    return value.strip()
 
 
 def _base_url() -> str:
-    cfg = _load_config()
-    url = cfg.get("base_url", "").strip()
-    if url:
-        return url.rstrip("/")
-    return os.getenv("NINEROUTER_URL", "http://127.0.0.1:20128").rstrip("/")
-
-
-def _api_key() -> str:
-    """Resolve 9Router API key: config → env → DB."""
-    cfg = _load_config()
-    key = cfg.get("api_key", "").strip()
-    if key:
-        return key
-    key = os.getenv("NINEROUTER_KEY", "").strip()
-    if key:
-        return key
-    return _read_db_key()
-
-
-_DB_KEY_CACHE: Optional[str] = None
-_DB_KEY_TIME: float = 0.0
+    url = (_string(_load_config(), "base_url") or _env("NINEROUTER_URL") or LOCAL_URL).rstrip("/")
+    try:
+        parsed = urlsplit(url)
+        parsed.port  # Validate malformed/out-of-range ports.
+        local = parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+        valid = (parsed.scheme == "https" or (parsed.scheme == "http" and local))
+        valid = valid and parsed.hostname and not (parsed.username or parsed.password or parsed.query or parsed.fragment)
+    except ValueError:
+        valid = False
+    if not valid or any(ch.isspace() for ch in url):
+        raise ValueError("9Router URL requires HTTPS (HTTP only for loopback), no credentials/query/fragment")
+    return url
 
 
 def _read_db_key() -> str:
-    """Read first API key from 9Router SQLite DB."""
-    global _DB_KEY_CACHE, _DB_KEY_TIME
-    import time
-    now = time.time()
-    if _DB_KEY_CACHE and now - _DB_KEY_TIME < 60:
-        return _DB_KEY_CACHE
-    db_path = Path.home() / ".9router" / "db" / "data.sqlite"
-    if not db_path.exists():
+    db = Path.home() / ".9router/db/data.sqlite"
+    if not db.is_file():
         return ""
     try:
-        conn = sqlite3.connect(str(db_path))
-        row = conn.execute("SELECT key FROM apiKeys LIMIT 1").fetchone()
-        conn.close()
-        _DB_KEY_CACHE = row[0] if row else ""
-        _DB_KEY_TIME = now
-    except Exception as e:
-        logger.debug("Failed to read 9Router DB key: %s", e)
-        _DB_KEY_CACHE = ""
-        _DB_KEY_TIME = now
-    return _DB_KEY_CACHE
+        with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=2)) as conn:
+            row = conn.execute("SELECT key FROM apiKeys WHERE isActive = 1 ORDER BY id LIMIT 1").fetchone()
+        return row[0] if row and isinstance(row[0], str) else ""
+    except sqlite3.Error:
+        raise ValueError("Cannot read active 9Router key from local database") from None
 
 
-def _search_model() -> str:
+def _api_key() -> str:
+    from hermes_constants import get_hermes_home
     cfg = _load_config()
-    return cfg.get("search_model", "search-combo")
-
-
-def _fetch_model() -> str:
-    cfg = _load_config()
-    return cfg.get("fetch_model", "fetch-combo")
-
-
-def _post(endpoint: str, payload: dict, timeout: int = 30) -> dict:
-    """POST to 9Router and return parsed JSON."""
-    import httpx
-    url = f"{_base_url()}{endpoint}"
-    headers = {"Content-Type": "application/json"}
-    key = _api_key()
+    key = _string(cfg, "api_key") or _env("NINEROUTER_KEY")
     if key:
-        headers["Authorization"] = f"Bearer {key}"
-    resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
+        return key
+    # Only the default profile inherits historical local DB discovery. Other
+    # profiles must explicitly opt in; remote origins never receive DB keys.
+    default_home = Path.home() / ".hermes"
+    auto = cfg.get("use_local_db_key", get_hermes_home().resolve() == default_home.resolve())
+    if not isinstance(auto, bool):
+        raise ValueError("web.9router.use_local_db_key must be boolean")
+    if auto and _base_url() == LOCAL_URL:
+        return _read_db_key()
+    return ""
+
+
+def _headers() -> dict:
+    key = _api_key()
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+def _model(kind: str) -> str:
+    return _string(_load_config(), kind + "_model", kind + "-combo") or kind + "-combo"
+
+
+def _decode(response: httpx.Response) -> dict:
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError("9Router response must be an object")
+    if data.get("error") or data.get("success") is False:
+        raise ValueError("9Router reported an upstream error")
+    return data
+
+
+def _post(endpoint: str, payload: dict) -> dict:
+    with httpx.Client(timeout=30, follow_redirects=False, trust_env=False) as client:
+        return _decode(client.post(_base_url() + endpoint, json=payload, headers=_headers()))
+
+
+def _error(exc: Exception) -> str:
+    # Never include upstream bodies, request URLs, config text, or credentials.
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"9Router HTTP {exc.response.status_code}"
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+        return "9Router request timed out"
+    return f"9Router request failed ({type(exc).__name__}); check configuration or upstream response"
+
+
+def _http_url(url: object) -> bool:
+    if not isinstance(url, str):
+        return False
+    try:
+        p = urlsplit(url)
+        return bool(p.scheme in {"http", "https"} and p.hostname and not (p.username or p.password) and not any(c.isspace() for c in url))
+    except ValueError:
+        return False
+
+
+async def _check_url(url: str) -> None:
+    from tools.url_safety import async_is_safe_url
+    from tools.website_policy import check_website_access
+    if not _http_url(url) or not await async_is_safe_url(url):
+        raise PermissionError("Blocked by URL safety policy")
+    if check_website_access(url):
+        raise PermissionError("Blocked by website policy")
 
 
 class NineRouterWebSearchProvider(WebSearchProvider):
-    """Proxy web search & extract to 9Router /v1/search and /v1/web/fetch."""
-
     @property
-    def name(self) -> str:
+    def name(self):
         return "9router"
 
     @property
-    def display_name(self) -> str:
+    def display_name(self):
         return "9Router"
 
-    def is_available(self) -> bool:
-        # Available if base_url is set or 9Router DB exists
-        return bool(_base_url())
-
-    def supports_search(self) -> bool:
-        return True
-
-    def supports_extract(self) -> bool:
-        return True
-
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
-        """Search via 9Router /v1/search."""
-        payload = {
-            "model": _search_model(),
-            "query": query,
-            "max_results": max(1, min(int(limit), 20)),
-        }
+    def is_available(self):
         try:
-            data = _post("/v1/search", payload)
+            from hermes_cli.config_effective import load_user_config_effective
+            raw = load_user_config_effective(fail_closed=True)
+            web = raw.get("web", {})
+            configured = (web.get("search_backend") == self.name or web.get("extract_backend") == self.name
+                          or bool(web.get("9router")) or bool(_env("NINEROUTER_URL")))
+            return bool(configured and _base_url())
+        except Exception:
+            return False
+
+    def supports_search(self):
+        return True
+
+    def supports_extract(self):
+        return True
+
+    def search(self, query: str, limit: int = 5) -> dict:
+        try:
+            if not isinstance(query, str) or not query.strip() or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+                raise ValueError("Invalid search query or limit")
+            data = _post("/v1/search", {"model": _model("search"), "query": query, "max_results": limit})
+            rows = data.get("results")
+            if not isinstance(rows, list) or (not rows and data.get("errors")):
+                raise ValueError("Invalid or failed search response")
+            web = []
+            for row in rows[:limit]:
+                if not isinstance(row, dict) or not _http_url(row.get("url")):
+                    raise ValueError("Invalid search result")
+                for field in ("title", "snippet", "content"):
+                    if row.get(field) is not None and not isinstance(row[field], str):
+                        raise ValueError("Invalid search text")
+                title = row.get("title") or ""
+                description = row.get("snippet") or row.get("content") or ""
+                if not isinstance(title, str) or not isinstance(description, str):
+                    raise ValueError("Invalid search text")
+                web.append({"title": title, "url": row["url"], "description": description,
+                            "position": len(web) + 1})
+            return {"success": True, "data": {"web": web}}
         except Exception as exc:
-            logger.error("9Router search failed: %s", exc)
-            return {"success": False, "error": f"9Router search failed: {exc}"}
+            return {"success": False, "error": _error(exc)}
 
-        if "error" in data:
-            msg = data["error"]
-            if isinstance(msg, dict):
-                msg = msg.get("message", str(msg))
-            return {"success": False, "error": msg}
-
-        results = data.get("results", [])
-        web = []
-        for r in results:
-            web.append({
-                "title": r.get("title", ""),
-                "url": r.get("url", ""),
-                "description": r.get("snippet", "") or r.get("content", "") or "",
-                "position": r.get("position", 0),
-            })
-        return {"success": True, "data": {"web": web}}
-
-    def extract(self, urls: List[str], **kwargs: Any) -> Any:
-        """Fetch page content via 9Router /v1/web/fetch."""
+    async def extract(self, urls: list[str], **kwargs) -> list[dict]:
         results = []
-        for url in urls:
-            payload = {
-                "model": _fetch_model(),
-                "url": url,
-            }
-            try:
-                data = _post("/v1/web/fetch", payload, timeout=45)
-            except Exception as exc:
-                logger.error("9Router fetch failed for %s: %s", url, exc)
-                results.append({
-                    "url": url,
-                    "title": "",
-                    "content": "",
-                    "raw_content": "",
-                    "error": f"9Router fetch failed: {exc}",
-                })
-                continue
-
-            if "error" in data:
-                msg = data["error"]
-                if isinstance(msg, dict):
-                    msg = msg.get("message", str(msg))
-                results.append({
-                    "url": url,
-                    "title": "",
-                    "content": "",
-                    "raw_content": "",
-                    "error": msg,
-                })
-                continue
-
-            content_obj = data.get("content", {})
-            if isinstance(content_obj, dict):
-                text = content_obj.get("text", "")
-            else:
-                text = str(content_obj)
-
-            results.append({
-                "url": data.get("url", url),
-                "title": data.get("title", ""),
-                "content": text,
-                "raw_content": text,
-                "metadata": data.get("metadata", {}),
-            })
-
+        format_ = kwargs.get("format") or "markdown"
+        # ponytail: sequential async requests keep ordering and cancellation simple;
+        # add bounded concurrency only if measured batch latency requires it.
+        async with httpx.AsyncClient(timeout=45, follow_redirects=False, trust_env=False) as client:
+            for url in urls:
+                try:
+                    if format_ not in {"markdown", "text", "html"}:
+                        raise ValueError("Unsupported extraction format")
+                    await _check_url(url)
+                    payload = {"model": _model("fetch"), "url": url, "format": format_}
+                    response = await asyncio.wait_for(client.post(_base_url() + "/v1/web/fetch", json=payload, headers=_headers()), timeout=45)
+                    data = _decode(response)
+                    if data.get("errors"):
+                        raise ValueError("Upstream fetch errors")
+                    final_url = data.get("url") or url
+                    await _check_url(final_url)
+                    content = data.get("content")
+                    text = content.get("text") if isinstance(content, dict) else content
+                    if not isinstance(text, str) or not text.strip():
+                        raise ValueError("Missing or invalid extracted text")
+                    title = data.get("title") or ""
+                    if not isinstance(title, str):
+                        raise ValueError("Invalid extracted title")
+                    results.append({"url": final_url, "title": title, "content": text, "raw_content": text,
+                                    "metadata": data.get("metadata") if isinstance(data.get("metadata"), dict) else {}})
+                except PermissionError as exc:
+                    results.append({"url": url, "title": "", "content": "", "error": str(exc), "blocked_by_policy": True})
+                except Exception as exc:
+                    results.append({"url": url, "title": "", "content": "", "error": _error(exc)})
         return results

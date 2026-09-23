@@ -1,6 +1,6 @@
 [project]
 name = "hermes-9router-web-plugin"
-version = "1.0.0"
+version = "1.1.0"
 description = "9Router Web Search & Web Fetch provider plugin for Hermes Agent"
 authors = [{ name = "dhansxd" }]
 dependencies = [
