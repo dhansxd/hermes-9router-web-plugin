@@ -1,0 +1,12 @@
+[project]
+name = "hermes-9router-web-search-plugin"
+version = "1.0.0"
+description = "9Router Web Search & Web Fetch provider plugin for Hermes Agent"
+authors = [{ name = "dhansxd" }]
+dependencies = [
+    "httpx>=0.24.0",
+    "pyyaml"
+]
+
+[project.entry-points."hermes_agent.plugins"]
+9router-web-search = "hermes_9router_web_search"

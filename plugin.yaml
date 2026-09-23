@@ -1,0 +1,7 @@
+name: 9router-web-search
+version: 1.0.0
+description: "9Router unified Web Search and Web Fetch proxy (Tavily/Exa/Antigravity combos)"
+author: dhansxd
+kind: backend
+provides_web_providers:
+  - 9router
