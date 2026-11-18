@@ -181,6 +181,7 @@ class ExtractTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.stack=ExitStack(); self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(m,'_load_config',return_value={}))
+        self.stack.enter_context(patch.object(m,'_env',return_value=''))
         self.stack.enter_context(patch.object(m,'_headers',return_value={}))
         self.safety=self.stack.enter_context(patch('tools.url_safety.async_is_safe_url',return_value=True))
         self.policy=self.stack.enter_context(patch('tools.website_policy.check_website_access',return_value=None))
